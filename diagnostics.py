@@ -447,9 +447,13 @@ def compute_drift_by_split_col(
                 for idx, (start, end) in enumerate(custom_time_ranges):
                     start_dt = pd.to_datetime(start)
                     end_dt = pd.to_datetime(end)
+                    if end_dt.hour == 0 and end_dt.minute == 0 and end_dt.second == 0:
+                        end_dt = end_dt + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                     mask = (valid_dt >= start_dt) & (valid_dt <= end_dt)
-                    count = mask.sum()
-                    label = f'范围{idx+1}: {start_dt.strftime("%Y-%m-%d")} ~ {end_dt.strftime("%Y-%m-%d")}'
+                    count = int(mask.sum())
+                    start_str = start_dt.strftime('%Y-%m-%d')
+                    end_str = pd.to_datetime(end).strftime('%Y-%m-%d')
+                    label = f'范围{idx+1}: {start_str} ~ {end_str}'
                     range_labels.append((label, mask, count))
                     meta['time_periods'].append(label)
 
@@ -687,36 +691,58 @@ def generate_augmentation_suggestions(class_balance: Dict[str, Any]) -> Dict[str
 
 def dataframe_fingerprint(df: pd.DataFrame, text_col: str, label_col: str) -> str:
     """计算数据指纹，用于缓存判断。
-    包含所有诊断相关列（文本、标签、source、split、时间列等）的多行采样，
-    只要任意一行的任意相关列变化，指纹就会变化。
+    包含所有诊断相关列的多行全内容采样，确保任何位置的任何变化都能检测到。
+    不对文本做截断，不遗漏长文本后半部分的变化。
     """
     n = len(df)
     if n == 0:
-        return hashlib.md5(f"empty_{df.columns.tolist()}".encode('utf-8')).hexdigest()
+        return hashlib.md5(f"empty_{sorted(df.columns.tolist())}".encode('utf-8')).hexdigest()
 
     diagnostic_cols = get_diagnostic_columns(df, text_col, label_col)
 
-    sample_size = min(100, n)
-    sample_indices = np.linspace(0, n - 1, sample_size, dtype=int).tolist()
+    sample_size = min(200, n)
+    if n <= sample_size:
+        sample_indices = list(range(n))
+    else:
+        sample_indices = []
+        step = n / sample_size
+        for i in range(sample_size):
+            idx = int(i * step)
+            if idx >= n:
+                idx = n - 1
+            sample_indices.append(idx)
+        if 0 not in sample_indices:
+            sample_indices[0] = 0
+        if (n - 1) not in sample_indices:
+            sample_indices[-1] = n - 1
 
-    sample_parts = []
+    hasher = hashlib.md5()
+    hasher.update(f"{n}".encode('utf-8'))
+    hasher.update(f"[{','.join(sorted(diagnostic_cols))}]".encode('utf-8'))
+
+    for col in diagnostic_cols:
+        if col not in df.columns:
+            hasher.update(b'__MISSING_COL__')
+            continue
+        series = df[col]
+        nunique = series.nunique()
+        hasher.update(f"|{col}:{nunique}".encode('utf-8'))
+
     for idx in sample_indices:
-        row_vals = []
+        row_parts = []
         for col in diagnostic_cols:
             if col in df.columns:
                 v = df.iloc[idx][col]
                 if pd.isna(v):
-                    row_vals.append('__NA__')
+                    row_parts.append('__NA__')
                 else:
-                    row_vals.append(str(v)[:40])
+                    row_parts.append(str(v))
             else:
-                row_vals.append('__MISSING__')
-        sample_parts.append(f"{idx}:{'|'.join(row_vals)}")
+                row_parts.append('__MISSING__')
+        row_str = f"{idx}:{'||'.join(row_parts)}"
+        hasher.update(row_str.encode('utf-8'))
 
-    sample_str = '||'.join(sample_parts)
-    cols_str = ','.join(diagnostic_cols)
-    fingerprint = f"{n}[{cols_str}]_{sample_str}"
-    return hashlib.md5(fingerprint.encode('utf-8')).hexdigest()
+    return hasher.hexdigest()
 
 
 def run_full_diagnostics(

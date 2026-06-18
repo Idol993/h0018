@@ -181,7 +181,10 @@ def generate_html_report(
     df: pd.DataFrame,
     diagnostics_results: Dict[str, Any],
     text_col: str,
-    label_col: str
+    label_col: str,
+    history: Optional[List[Dict[str, Any]]] = None,
+    compare_idx_a: Optional[int] = None,
+    compare_idx_b: Optional[int] = None
 ) -> str:
     cb = diagnostics_results['class_balance']
     qs = diagnostics_results['quality_scores']
@@ -222,6 +225,113 @@ def generate_html_report(
                 {'  ⚠️ 存在显著漂移' if (d['text_length_js'] > 0.2 or d['tfidf_js'] > 0.2) else ''}
             </p>
         </div>
+        '''
+
+    history_html = ''
+    drift_compare_html = ''
+    if history and len(history) > 0:
+        hist_rows_html = ''
+        for i, h in enumerate(history):
+            m = h['metrics']
+            qscore = f'{m["quality_score"]:.1%}' if m.get('quality_score') is not None else '未执行'
+            nscore = f'{m["noise_ratio"]:.1%}' if m.get('noise_ratio') is not None else '未执行'
+            hist_rows_html += f'''
+            <tr>
+                <td>#{i+1}</td>
+                <td>{h['timestamp']}</td>
+                <td>{h.get('filename', '未知')}</td>
+                <td>{h['total_samples']}</td>
+                <td>{qscore}</td>
+                <td>{nscore}</td>
+                <td>{m.get('max_tfidf_js', 0):.4f}</td>
+                <td>{h.get('split_method', '默认')}</td>
+            </tr>
+            '''
+        history_html = f'''
+        <h2>📜 诊断历史记录</h2>
+        <p style="color:#666;">保留最近 {len(history)} 次诊断记录，最新在最后</p>
+        <table>
+            <tr>
+                <th>序号</th><th>时间</th><th>文件名</th><th>样本数</th>
+                <th>综合评分</th><th>噪声比例</th><th>最大漂移JS</th><th>切分方式</th>
+            </tr>
+            {hist_rows_html}
+        </table>
+        '''
+
+        if compare_idx_a is not None and compare_idx_b is not None:
+            if 0 <= compare_idx_a < len(history) and 0 <= compare_idx_b < len(history):
+                rec_a = history[compare_idx_a]
+                rec_b = history[compare_idx_b]
+
+                def drift_key(d):
+                    return f'{d["split_label_a"]}__vs__{d["split_label_b"]}'
+
+                dict_a = {drift_key(d): d for d in rec_a.get('drift_results', [])}
+                dict_b = {drift_key(d): d for d in rec_b.get('drift_results', [])}
+
+                all_keys = sorted(set(list(dict_a.keys()) + list(dict_b.keys())))
+                added = [k for k in all_keys if k in dict_a and k not in dict_b]
+                removed = [k for k in all_keys if k not in dict_a and k in dict_b]
+                common = [k for k in all_keys if k in dict_a and k in dict_b]
+
+                common_with_diff = []
+                for k in common:
+                    d_a = dict_a[k]
+                    d_b = dict_b[k]
+                    js_len_diff = abs(d_a['text_length_js'] - d_b['text_length_js'])
+                    js_tf_diff = abs(d_a['tfidf_js'] - d_b['tfidf_js'])
+                    common_with_diff.append((k, js_len_diff + js_tf_diff, d_a, d_b))
+                common_with_diff.sort(key=lambda x: x[1], reverse=True)
+
+                added_html = ''
+                if added:
+                    items = ''.join(
+                        f'<li><strong>{dict_a[k]["split_label_a"]} vs {dict_a[k]["split_label_b"]}</strong> — 长度JS={dict_a[k]["text_length_js"]:.4f}, 词频JS={dict_a[k]["tfidf_js"]:.4f}</li>'
+                        for k in added[:10]
+                    )
+                    added_html = f'<p><strong>✨ 新增的切分组 ({len(added)}):</strong></p><ul>{items}</ul>'
+
+                removed_html = ''
+                if removed:
+                    items = ''.join(
+                        f'<li><strong>{dict_b[k]["split_label_a"]} vs {dict_b[k]["split_label_b"]}</strong> — 长度JS={dict_b[k]["text_length_js"]:.4f}, 词频JS={dict_b[k]["tfidf_js"]:.4f}</li>'
+                        for k in removed[:10]
+                    )
+                    removed_html = f'<p><strong>❌ 消失的切分组 ({len(removed)}):</strong></p><ul>{items}</ul>'
+
+                common_html = ''
+                if common_with_diff:
+                    rows = ''
+                    for k, diff, d_a, d_b in common_with_diff[:10]:
+                        rows += f'''
+                        <tr>
+                            <td>{d_a["split_label_a"]} vs {d_a["split_label_b"]}</td>
+                            <td>{d_a["text_length_js"]:.4f}</td>
+                            <td>{d_b["text_length_js"]:.4f}</td>
+                            <td>{d_a["tfidf_js"]:.4f}</td>
+                            <td>{d_b["tfidf_js"]:.4f}</td>
+                        </tr>
+                        '''
+                    common_html = f'''
+                    <p><strong>📊 变化最大的切分组 Top 10:</strong></p>
+                    <table>
+                        <tr><th>切分组</th><th>长度JS (记录{compare_idx_a+1})</th><th>长度JS (记录{compare_idx_b+1})</th>
+                            <th>词频JS (记录{compare_idx_a+1})</th><th>词频JS (记录{compare_idx_b+1})</th></tr>
+                        {rows}
+                    </table>
+                    '''
+
+                drift_compare_html = f'''
+        <h2>🔍 漂移版本对比</h2>
+        <p style="color:#666;">
+            <strong>对比:</strong> 记录 #{compare_idx_a+1} ({rec_a["timestamp"]}) vs 记录 #{compare_idx_b+1} ({rec_b["timestamp"]})
+            &nbsp;&nbsp;|&nbsp;&nbsp;
+            共 {len(all_keys)} 个切分组：{len(common)} 个共有，{len(added)} 个新增，{len(removed)} 个消失
+        </p>
+        {added_html}
+        {removed_html}
+        {common_html}
         '''
 
     class_rows = ''
@@ -415,6 +525,8 @@ def generate_html_report(
         {drift_info_html}
     </table>
     {drift_charts_html}
+    {history_html}
+    {drift_compare_html}
 
     <h2>💡 修复与优化建议</h2>
     <ul>{suggestions_html}</ul>
@@ -437,13 +549,68 @@ def render_overview_tab(df: pd.DataFrame, diag: Dict[str, Any], text_col: str, l
     lim = diag.get('label_issues_meta', {})
 
     history = st.session_state.get('diagnostics_history', [])
-    if history:
-        prev_record = history[-1]
-        prev_metrics = prev_record['metrics']
-        curr_metrics = extract_comparison_metrics(diag)
 
-        st.markdown('### 📈 与上一次诊断对比')
-        st.caption(f'上一次诊断时间: {prev_record["timestamp"]}  |  样本数: {prev_record["total_samples"]} → {curr_metrics["total_samples"]}')
+    with st.expander('📜 诊断历史记录', expanded=len(history) > 0):
+        if not history:
+            st.info('暂无历史记录，运行过多次诊断后会在这里显示')
+        else:
+            st.markdown('**最近诊断记录（最新在最后）**')
+            hist_df = pd.DataFrame([
+                {
+                    '序号': i + 1,
+                    '时间': h['timestamp'],
+                    '文件名': h.get('filename', '未知'),
+                    '样本数': h['total_samples'],
+                    '文本列': h.get('text_col', ''),
+                    '标签列': h.get('label_col', ''),
+                    '切分方式': h.get('split_method', '默认'),
+                    '综合评分': f"{h['metrics']['quality_score']:.1%}" if h['metrics'].get('quality_score') is not None else '未执行',
+                    '噪声比例': f"{h['metrics']['noise_ratio']:.1%}" if h['metrics'].get('noise_ratio') is not None else '未执行',
+                    '最大漂移JS': f"{h['metrics']['max_tfidf_js']:.4f}"
+                }
+                for i, h in enumerate(history)
+            ])
+            st.dataframe(hist_df, use_container_width=True, hide_index=True)
+
+            st.markdown('---')
+            st.markdown('**🔍 选择两条记录进行对比**')
+            col_a, col_b = st.columns(2)
+            with col_a:
+                hist_options = [f"#{i+1} {h['timestamp']} - {h.get('filename', '未知')} ({h['total_samples']}条)" for i, h in enumerate(history)]
+                default_a = len(history) - 1 if len(history) >= 1 else 0
+                idx_a = st.selectbox('记录 A（较新）', options=list(range(len(history))),
+                                     index=default_a, format_func=lambda x: hist_options[x], key='cmp_a')
+            with col_b:
+                default_b = len(history) - 2 if len(history) >= 2 else 0
+                idx_b = st.selectbox('记录 B（较旧）', options=list(range(len(history))),
+                                     index=default_b, format_func=lambda x: hist_options[x], key='cmp_b')
+
+            if st.button('📊 对比选中的两条记录', type='primary', key='compare_btn', disabled=len(history) < 2):
+                st.session_state['compare_history_a'] = idx_a
+                st.session_state['compare_history_b'] = idx_b
+
+    cmp_a = st.session_state.get('compare_history_a')
+    cmp_b = st.session_state.get('compare_history_b')
+    show_comparison = False
+    prev_metrics = None
+    if cmp_a is not None and cmp_b is not None and len(history) > max(cmp_a, cmp_b):
+        show_comparison = True
+        prev_metrics = history[cmp_b]['metrics']
+
+    if not show_comparison and history:
+        prev_metrics = history[-1]['metrics']
+        show_comparison = True
+
+    if show_comparison and prev_metrics:
+        cmp_label = ''
+        if cmp_a is not None and cmp_b is not None:
+            cmp_label = f"记录 #{cmp_a+1} vs 记录 #{cmp_b+1}"
+            curr_metrics = history[cmp_a]['metrics']
+        else:
+            cmp_label = '本次 vs 上一次'
+            curr_metrics = extract_comparison_metrics(diag)
+
+        st.markdown(f'### 📈 版本对比 ({cmp_label})')
 
         metric_display = [
             ('综合质量评分', 'quality_score', True, '%'),
@@ -451,10 +618,12 @@ def render_overview_tab(df: pd.DataFrame, diag: Dict[str, Any], text_col: str, l
             ('噪声样本比例', 'noise_ratio', False, '%'),
             ('类别平衡得分', 'balance_score', True, '%'),
             ('Gini不纯度', 'gini_impurity', False, ''),
+            ('类别数量', 'num_classes', False, ''),
             ('小类别数量', 'num_small_classes', False, ''),
             ('极小类别数量', 'num_tiny_classes', False, ''),
             ('最大文本长度JS', 'max_text_length_js', False, ''),
             ('最大词频JS', 'max_tfidf_js', False, ''),
+            ('漂移对比组数', 'num_drift_groups', False, ''),
         ]
 
         cols = st.columns(4)
@@ -472,11 +641,7 @@ def render_overview_tab(df: pd.DataFrame, diag: Dict[str, Any], text_col: str, l
                     curr_str = f'{curr_val}'
 
                 diff_html = format_diff(curr_val, prev_val, suffix, higher_better)
-                st.metric(
-                    name,
-                    curr_str,
-                    help='与上一次诊断的变化'
-                )
+                st.metric(name, curr_str, help='与对比记录的变化')
                 if diff_html:
                     st.markdown(diff_html, unsafe_allow_html=True)
 
@@ -546,7 +711,14 @@ def render_overview_tab(df: pd.DataFrame, diag: Dict[str, Any], text_col: str, l
 
     st.markdown('---')
     st.subheader('📄 一键导出诊断报告')
-    html_report = generate_html_report(df, diag, text_col, label_col)
+    history = st.session_state.get('diagnostics_history', [])
+    cmp_a = st.session_state.get('compare_history_a')
+    cmp_b = st.session_state.get('compare_history_b')
+    html_report = generate_html_report(
+        df, diag, text_col, label_col,
+        history=history if history else None,
+        compare_idx_a=cmp_a, compare_idx_b=cmp_b
+    )
     st.markdown(get_download_link(html_report), unsafe_allow_html=True)
     st.caption('HTML报告包含交互式图表（需联网加载Plotly.js），并内置SVG备用图可离线查看')
 
@@ -973,30 +1145,147 @@ def render_distribution_drift_tab(df: pd.DataFrame, diag: Dict[str, Any], text_c
             unique_counts = list(dict.fromkeys(period_counts))
             st.caption('各时间段样本数: ' + ' | '.join(unique_counts))
 
-    if not drifts:
-        st.info('未检测到有效的漂移对比组（可能样本太少或切分列取值不足）')
+    history = st.session_state.get('diagnostics_history', [])
+    drift_view = st.radio(
+        '视图模式',
+        ['📊 当前诊断', '🔍 版本对比'],
+        index=0,
+        horizontal=True,
+        key='drift_view_mode'
+    )
+
+    if drift_view == '📊 当前诊断':
+        if not drifts:
+            st.info('未检测到有效的漂移对比组（可能样本太少或切分列取值不足）')
+        else:
+            for i, d in enumerate(drifts):
+                st.markdown(f'#### 切分 {i + 1}: {d["split_label_a"]} vs {d["split_label_b"]}')
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    js_len = d['text_length_js']
+                    status_len = '🔴 显著漂移' if js_len > 0.2 else '🟢 正常'
+                    st.metric(f'文本长度 JS散度: {status_len}', f'{js_len:.4f}')
+                with c2:
+                    js_tf = d['tfidf_js']
+                    status_tf = '🔴 显著漂移' if js_tf > 0.2 else '🟢 正常'
+                    st.metric(f'TF-IDF词频 JS散度: {status_tf}', f'{js_tf:.4f}')
+                with c3:
+                    st.metric('样本数 (A / B)', f"{d['size_a']} / {d['size_b']}")
+                    st.caption(f'平均长度: {d["avg_len_a"]:.0f} / {d["avg_len_b"]:.0f}')
+
+                if js_len > 0.2 or js_tf > 0.2:
+                    st.warning(f'⚠️ 该切分存在显著分布漂移，可能影响模型泛化能力')
+
+                drift_fig = generate_drift_fig(d)
+                st.plotly_chart(drift_fig, use_container_width=True)
+
     else:
-        for i, d in enumerate(drifts):
-            st.markdown(f'#### 切分 {i + 1}: {d["split_label_a"]} vs {d["split_label_b"]}')
+        st.markdown('#### 🔍 漂移版本对比')
+        if len(history) < 1:
+            st.info('至少需要1条历史诊断记录才能进行漂移对比')
+        else:
+            col_c1, col_c2 = st.columns(2)
+            with col_c1:
+                hist_options = [f"#{i+1} {h['timestamp']} - {h.get('filename', '未知')}" for i, h in enumerate(history)]
+                hist_options_current = ['当前诊断'] + hist_options
+                idx_a = st.selectbox('版本 A（较新）', options=list(range(len(hist_options_current))),
+                                     index=0, format_func=lambda x: hist_options_current[x], key='drift_cmp_a')
+            with col_c2:
+                default_b = min(1, len(hist_options_current) - 1)
+                idx_b = st.selectbox('版本 B（较旧）', options=list(range(len(hist_options_current))),
+                                     index=default_b, format_func=lambda x: hist_options_current[x], key='drift_cmp_b')
 
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                js_len = d['text_length_js']
-                status_len = '🔴 显著漂移' if js_len > 0.2 else '🟢 正常'
-                st.metric(f'文本长度 JS散度: {status_len}', f'{js_len:.4f}')
-            with c2:
-                js_tf = d['tfidf_js']
-                status_tf = '🔴 显著漂移' if js_tf > 0.2 else '🟢 正常'
-                st.metric(f'TF-IDF词频 JS散度: {status_tf}', f'{js_tf:.4f}')
-            with c3:
-                st.metric('样本数 (A / B)', f"{d['size_a']} / {d['size_b']}")
-                st.caption(f'平均长度: {d["avg_len_a"]:.0f} / {d["avg_len_b"]:.0f}')
+            if idx_a == idx_b:
+                st.warning('请选择两个不同的版本进行对比')
+            else:
+                if idx_a == 0:
+                    drifts_a = drifts
+                    meta_a = drift_meta
+                    label_a = '当前诊断'
+                else:
+                    rec_a = history[idx_a - 1]
+                    drifts_a = rec_a.get('drift_results', [])
+                    meta_a = rec_a.get('drift_meta', {})
+                    label_a = f"记录 #{idx_a}"
 
-            if js_len > 0.2 or js_tf > 0.2:
-                st.warning(f'⚠️ 该切分存在显著分布漂移，可能影响模型泛化能力')
+                if idx_b == 0:
+                    drifts_b = drifts
+                    meta_b = drift_meta
+                    label_b = '当前诊断'
+                else:
+                    rec_b = history[idx_b - 1]
+                    drifts_b = rec_b.get('drift_results', [])
+                    meta_b = rec_b.get('drift_meta', {})
+                    label_b = f"记录 #{idx_b}"
 
-            drift_fig = generate_drift_fig(d)
-            st.plotly_chart(drift_fig, use_container_width=True)
+                def drift_key(d):
+                    return f'{d["split_label_a"]}__vs__{d["split_label_b"]}'
+
+                dict_a = {drift_key(d): d for d in drifts_a}
+                dict_b = {drift_key(d): d for d in drifts_b}
+
+                all_keys = sorted(set(list(dict_a.keys()) + list(dict_b.keys())))
+
+                added = [k for k in all_keys if k in dict_a and k not in dict_b]
+                removed = [k for k in all_keys if k not in dict_a and k in dict_b]
+                common = [k for k in all_keys if k in dict_a and k in dict_b]
+
+                common_with_diff = []
+                for k in common:
+                    d_a = dict_a[k]
+                    d_b = dict_b[k]
+                    js_len_diff = abs(d_a['text_length_js'] - d_b['text_length_js'])
+                    js_tf_diff = abs(d_a['tfidf_js'] - d_b['tfidf_js'])
+                    common_with_diff.append((k, js_len_diff + js_tf_diff, d_a, d_b))
+                common_with_diff.sort(key=lambda x: x[1], reverse=True)
+
+                st.markdown(f'**对比结果:** {label_a} vs {label_b}')
+                st.caption(f'共 {len(all_keys)} 个切分组：{len(common)} 个共有，{len(added)} 个新增，{len(removed)} 个消失')
+
+                if added:
+                    st.markdown(f'##### ✨ 新增的切分组 ({len(added)})')
+                    for k in added[:10]:
+                        d = dict_a[k]
+                        st.info(f'**{d["split_label_a"]} vs {d["split_label_b"]}**  '
+                                f'长度JS={d["text_length_js"]:.4f}, 词频JS={d["tfidf_js"]:.4f}, 样本={d["size_a"]}/{d["size_b"]}')
+
+                if removed:
+                    st.markdown(f'##### ❌ 消失的切分组 ({len(removed)})')
+                    for k in removed[:10]:
+                        d = dict_b[k]
+                        st.warning(f'**{d["split_label_a"]} vs {d["split_label_b"]}**  '
+                                   f'长度JS={d["text_length_js"]:.4f}, 词频JS={d["tfidf_js"]:.4f}, 样本={d["size_a"]}/{d["size_b"]}')
+
+                if common_with_diff:
+                    st.markdown(f'##### 📊 变化最大的切分组 Top 10')
+                    top_changes = common_with_diff[:10]
+                    rows = []
+                    for k, total_diff, d_a, d_b in top_changes:
+                        len_a = d_a['text_length_js']
+                        len_b = d_b['text_length_js']
+                        tf_a = d_a['tfidf_js']
+                        tf_b = d_b['tfidf_js']
+                        len_diff = len_a - len_b
+                        tf_diff = tf_a - tf_b
+                        len_arrow = '↑' if len_diff > 0 else '↓' if len_diff < 0 else '—'
+                        tf_arrow = '↑' if tf_diff > 0 else '↓' if tf_diff < 0 else '—'
+                        label_a_d = d_a['split_label_a']
+                        label_b_d = d_a['split_label_b']
+                        rows.append({
+                            '切分组': f'{label_a_d} vs {label_b_d}',
+                            f'长度JS ({label_a})': f'{len_a:.4f}',
+                            f'长度JS ({label_b})': f'{len_b:.4f}',
+                            '长度变化': f'{len_arrow} {abs(len_diff):.4f}',
+                            f'词频JS ({label_a})': f'{tf_a:.4f}',
+                            f'词频JS ({label_b})': f'{tf_b:.4f}',
+                            '词频变化': f'{tf_arrow} {abs(tf_diff):.4f}',
+                        })
+                    if rows:
+                        cmp_df = pd.DataFrame(rows)
+                        st.dataframe(cmp_df, use_container_width=True, hide_index=True)
+                elif not added and not removed:
+                    st.info('两个版本的切分组完全相同，且没有变化')
 
 
 def get_dataset_fingerprint(df: pd.DataFrame, text_col: str, label_col: str,
@@ -1049,7 +1338,14 @@ def format_diff(current: Any, previous: Any, suffix: str = '', is_higher_better:
         else:
             arrow = '↓' if is_higher_better else '↓✅'
             color = 'red' if is_higher_better else 'green'
-        return f'<span style="color:{color};font-weight:bold;">{arrow} {abs(diff):.2%}{suffix}</span>'
+        abs_diff = abs(diff)
+        if suffix == '%':
+            diff_str = f'{abs_diff:.2%}'
+        elif isinstance(abs_diff, float) and abs_diff < 1:
+            diff_str = f'{abs_diff:.4f}'
+        else:
+            diff_str = f'{abs_diff:.0f}'
+        return f'<span style="color:{color};font-weight:bold;">{arrow} {diff_str}{suffix if suffix != "%" else ""}</span>'
     except Exception:
         return ''
 
@@ -1064,6 +1360,8 @@ def main():
         st.session_state['diagnostics'] = None
     if 'diagnostics_history' not in st.session_state:
         st.session_state['diagnostics_history'] = []
+    if 'history_max_records' not in st.session_state:
+        st.session_state['history_max_records'] = 10
     if 'text_col' not in st.session_state:
         st.session_state['text_col'] = None
     if 'label_col' not in st.session_state:
@@ -1080,6 +1378,12 @@ def main():
         st.session_state['time_granularity'] = 'half'
     if 'custom_time_ranges' not in st.session_state:
         st.session_state['custom_time_ranges'] = None
+    if 'current_filename' not in st.session_state:
+        st.session_state['current_filename'] = None
+    if 'compare_history_a' not in st.session_state:
+        st.session_state['compare_history_a'] = None
+    if 'compare_history_b' not in st.session_state:
+        st.session_state['compare_history_b'] = None
 
     with st.sidebar:
         st.header('📂 数据输入')
@@ -1106,6 +1410,7 @@ def main():
                         df = load_csv(uploaded_file)
                     else:
                         df = load_json(uploaded_file)
+                    st.session_state['current_filename'] = uploaded_file.name
                     st.success(f'✅ 成功加载 {len(df)} 条数据')
                 except Exception as e:
                     st.error(f'文件加载失败: {str(e)}')
@@ -1118,6 +1423,7 @@ def main():
                     with st.spinner('正在从HuggingFace加载...'):
                         df = load_huggingface(hf_name, hf_split)
                         if df is not None:
+                            st.session_state['current_filename'] = f'{hf_name} ({hf_split})'
                             st.success(f'✅ 成功加载 {len(df)} 条数据')
 
         elif input_mode == '使用示例数据':
@@ -1157,6 +1463,7 @@ def main():
 
                 dup_idx = np.random.choice(n, size=15, replace=False)
                 df.loc[dup_idx, 'text'] = df.loc[dup_idx, 'text']
+                st.session_state['current_filename'] = '示例数据 (模拟)'
                 st.success(f'✅ 已生成 {len(df)} 条示例数据（含约8%噪声，含source来源列和created_at时间列）')
 
         if df is not None:
@@ -1244,15 +1551,23 @@ def main():
                 prev_diag = st.session_state.get('diagnostics')
                 if prev_diag is not None:
                     history = st.session_state.get('diagnostics_history', [])
-                    history.append({
+                    drift_meta = prev_diag.get('drift_meta', {})
+                    history_record = {
                         'timestamp': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'metrics': extract_comparison_metrics(prev_diag),
+                        'filename': st.session_state.get('current_filename', '未知'),
                         'text_col': st.session_state.get('text_col'),
                         'label_col': st.session_state.get('label_col'),
-                        'total_samples': prev_diag.get('total_samples')
-                    })
-                    if len(history) > 2:
-                        history = history[-2:]
+                        'total_samples': prev_diag.get('total_samples'),
+                        'split_method': drift_meta.get('method', '默认'),
+                        'split_col': drift_meta.get('split_col'),
+                        'metrics': extract_comparison_metrics(prev_diag),
+                        'drift_results': prev_diag.get('distribution_drift', []),
+                        'drift_meta': drift_meta
+                    }
+                    history.append(history_record)
+                    max_records = st.session_state.get('history_max_records', 10)
+                    if len(history) > max_records:
+                        history = history[-max_records:]
                     st.session_state['diagnostics_history'] = history
                 st.session_state['diagnostics'] = diag
                 st.toast('✅ 诊断完成！', icon='🎉')
