@@ -18,6 +18,30 @@ DATETIME_KEYWORDS = [
     '发布时间', '记录时间', 'create_time', 'update_time', 'pub_time'
 ]
 
+DRIFT_RELATED_KEYWORDS = [
+    'source', 'split', '来源', '渠道', 'domain', 'platform',
+    'group', 'batch', '批次', '分区'
+] + DATETIME_KEYWORDS
+
+
+def get_diagnostic_columns(df: pd.DataFrame, text_col: str, label_col: str) -> List[str]:
+    """获取所有诊断相关列：文本列、标签列、以及可能用作切分的列"""
+    cols = [text_col, label_col]
+    for col in df.columns:
+        if col in cols:
+            continue
+        col_lower = str(col).lower()
+        if any(kw.lower() in col_lower for kw in DRIFT_RELATED_KEYWORDS):
+            cols.append(col)
+            continue
+        nunique = df[col].nunique()
+        if 2 <= nunique <= min(20, len(df) * 0.5):
+            cols.append(col)
+            continue
+        if is_datetime_col(df[col], col):
+            cols.append(col)
+    return cols
+
 
 def is_datetime_col(series: pd.Series, col_name: str = '') -> bool:
     """判断一列是否是时间/日期类型"""
@@ -323,7 +347,9 @@ def compute_drift_by_split_col(
     df: pd.DataFrame,
     text_col: str,
     split_col: str,
-    mode: str = 'pairwise'
+    mode: str = 'pairwise',
+    time_granularity: str = 'half',
+    custom_time_ranges: Optional[List[Tuple[Any, Any]]] = None
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     根据指定列计算分布漂移
@@ -332,13 +358,29 @@ def compute_drift_by_split_col(
       - 'pairwise': 两两比较所有不同取值
       - 'first_vs_rest': 第一个取值 vs 其他所有
       - 'auto': 若取值<=5用pairwise，否则first_vs_rest
-      - 时间列: 自动按时间前后段切分
+      - 时间列: 根据time_granularity切分
+
+    time_granularity (仅时间列有效):
+      - 'half': 时间前段 vs 时间后段（默认）
+      - 'month': 按月份对比
+      - 'quarter': 按季度对比
+      - 'custom': 自定义时间范围对比
+
+    custom_time_ranges: [(start1, end1), (start2, end2)] 自定义时间范围对
 
     Returns:
-        (drift_results, meta_info
+        (drift_results, meta_info)
     """
     results = []
-    meta = {'method': '', 'is_time_split': False}
+    meta = {
+        'method': '',
+        'is_time_split': False,
+        'time_granularity': time_granularity,
+        'total_rows': len(df),
+        'valid_time_rows': 0,
+        'invalid_time_rows': 0,
+        'time_periods': []
+    }
     if split_col not in df.columns:
         return results, meta
 
@@ -347,25 +389,105 @@ def compute_drift_by_split_col(
     if is_datetime_col(series, split_col):
         dt_series = parse_datetime_safe(series)
         valid_mask = dt_series.notna()
-        if valid_mask.sum() >= 10:
-            sorted_idx = np.argsort(dt_series[valid_mask])
-            n_valid = len(sorted_idx)
-            mid = n_valid // 2
-            first_half_idx = sorted_idx[:mid]
-            second_half_idx = sorted_idx[mid:]
-            if len(first_half_idx) > 0 and len(second_half_idx) > 0:
-                texts_a = df.iloc[first_half_idx][text_col].astype(str).tolist()
-                texts_b = df.iloc[second_half_idx][text_col].astype(str).tolist()
-                drift = check_distribution_drift(
-                    texts_a, texts_b,
-                    label_a='时间前段',
-                    label_b='时间后段',
-                    split_col_name=split_col
-                )
-                results.append(drift)
-                meta['method'] = f'按时间列[{split_col}]前后段切分'
-                meta['is_time_split'] = True
-                return results, meta
+        n_total = len(df)
+        n_valid = valid_mask.sum()
+        n_invalid = n_total - n_valid
+        meta['valid_time_rows'] = int(n_valid)
+        meta['invalid_time_rows'] = int(n_invalid)
+
+        if n_valid >= 10:
+            meta['is_time_split'] = True
+            valid_df = df[valid_mask].copy()
+            valid_dt = dt_series[valid_mask]
+            valid_df['__dt__'] = valid_dt
+
+            if time_granularity == 'month':
+                valid_df['__period__'] = valid_dt.dt.to_period('M').astype(str)
+                periods = sorted(valid_df['__period__'].unique())
+                meta['time_periods'] = periods
+                meta['method'] = f'按时间列[{split_col}]月份对比 ({len(periods)}个月)'
+                if len(periods) >= 2:
+                    for i in range(len(periods)):
+                        for j in range(i + 1, len(periods)):
+                            p_a, p_b = periods[i], periods[j]
+                            texts_a = valid_df[valid_df['__period__'] == p_a][text_col].astype(str).tolist()
+                            texts_b = valid_df[valid_df['__period__'] == p_b][text_col].astype(str).tolist()
+                            if len(texts_a) > 0 and len(texts_b) > 0:
+                                drift = check_distribution_drift(
+                                    texts_a, texts_b,
+                                    label_a=f'{p_a}',
+                                    label_b=f'{p_b}',
+                                    split_col_name=split_col
+                                )
+                                results.append(drift)
+
+            elif time_granularity == 'quarter':
+                valid_df['__period__'] = valid_dt.dt.to_period('Q').astype(str)
+                periods = sorted(valid_df['__period__'].unique())
+                meta['time_periods'] = periods
+                meta['method'] = f'按时间列[{split_col}]季度对比 ({len(periods)}个季度)'
+                if len(periods) >= 2:
+                    for i in range(len(periods)):
+                        for j in range(i + 1, len(periods)):
+                            p_a, p_b = periods[i], periods[j]
+                            texts_a = valid_df[valid_df['__period__'] == p_a][text_col].astype(str).tolist()
+                            texts_b = valid_df[valid_df['__period__'] == p_b][text_col].astype(str).tolist()
+                            if len(texts_a) > 0 and len(texts_b) > 0:
+                                drift = check_distribution_drift(
+                                    texts_a, texts_b,
+                                    label_a=f'{p_a}',
+                                    label_b=f'{p_b}',
+                                    split_col_name=split_col
+                                )
+                                results.append(drift)
+
+            elif time_granularity == 'custom' and custom_time_ranges and len(custom_time_ranges) >= 2:
+                meta['method'] = f'按时间列[{split_col}]自定义范围对比'
+                range_labels = []
+                for idx, (start, end) in enumerate(custom_time_ranges):
+                    start_dt = pd.to_datetime(start)
+                    end_dt = pd.to_datetime(end)
+                    mask = (valid_dt >= start_dt) & (valid_dt <= end_dt)
+                    count = mask.sum()
+                    label = f'范围{idx+1}: {start_dt.strftime("%Y-%m-%d")} ~ {end_dt.strftime("%Y-%m-%d")}'
+                    range_labels.append((label, mask, count))
+                    meta['time_periods'].append(label)
+
+                for i in range(len(range_labels)):
+                    for j in range(i + 1, len(range_labels)):
+                        label_a, mask_a, cnt_a = range_labels[i]
+                        label_b, mask_b, cnt_b = range_labels[j]
+                        if cnt_a > 0 and cnt_b > 0:
+                            texts_a = valid_df[mask_a][text_col].astype(str).tolist()
+                            texts_b = valid_df[mask_b][text_col].astype(str).tolist()
+                            drift = check_distribution_drift(
+                                texts_a, texts_b,
+                                label_a=label_a,
+                                label_b=label_b,
+                                split_col_name=split_col
+                            )
+                            results.append(drift)
+
+            else:
+                sorted_idx = np.argsort(valid_dt.values)
+                n_valid_sorted = len(sorted_idx)
+                mid = n_valid_sorted // 2
+                first_half_idx = valid_df.index[sorted_idx[:mid]]
+                second_half_idx = valid_df.index[sorted_idx[mid:]]
+                if len(first_half_idx) > 0 and len(second_half_idx) > 0:
+                    texts_a = valid_df.loc[first_half_idx, text_col].astype(str).tolist()
+                    texts_b = valid_df.loc[second_half_idx, text_col].astype(str).tolist()
+                    drift = check_distribution_drift(
+                        texts_a, texts_b,
+                        label_a='时间前段',
+                        label_b='时间后段',
+                        split_col_name=split_col
+                    )
+                    results.append(drift)
+                    meta['method'] = f'按时间列[{split_col}]前后段切分'
+                    meta['time_periods'] = ['时间前段', '时间后段']
+
+            return results, meta
 
     series_clean = series.dropna()
     unique_vals = series_clean.unique().tolist()
@@ -564,22 +686,36 @@ def generate_augmentation_suggestions(class_balance: Dict[str, Any]) -> Dict[str
 
 
 def dataframe_fingerprint(df: pd.DataFrame, text_col: str, label_col: str) -> str:
-    """计算数据指纹，用于缓存判断。采样多行列内容，避免内容不同但首行相同的误判"""
+    """计算数据指纹，用于缓存判断。
+    包含所有诊断相关列（文本、标签、source、split、时间列等）的多行采样，
+    只要任意一行的任意相关列变化，指纹就会变化。
+    """
     n = len(df)
     if n == 0:
         return hashlib.md5(f"empty_{df.columns.tolist()}".encode('utf-8')).hexdigest()
 
-    sample_size = min(50, n)
+    diagnostic_cols = get_diagnostic_columns(df, text_col, label_col)
+
+    sample_size = min(100, n)
     sample_indices = np.linspace(0, n - 1, sample_size, dtype=int).tolist()
 
     sample_parts = []
     for idx in sample_indices:
-        t = str(df.iloc[idx][text_col]) if text_col in df.columns else ''
-        l = str(df.iloc[idx][label_col]) if label_col in df.columns else ''
-        sample_parts.append(f"{idx}:{t[:30]}:{l}")
+        row_vals = []
+        for col in diagnostic_cols:
+            if col in df.columns:
+                v = df.iloc[idx][col]
+                if pd.isna(v):
+                    row_vals.append('__NA__')
+                else:
+                    row_vals.append(str(v)[:40])
+            else:
+                row_vals.append('__MISSING__')
+        sample_parts.append(f"{idx}:{'|'.join(row_vals)}")
 
-    sample_str = '|'.join(sample_parts)
-    fingerprint = f"{n}_{df.columns.tolist()}_{sample_str}"
+    sample_str = '||'.join(sample_parts)
+    cols_str = ','.join(diagnostic_cols)
+    fingerprint = f"{n}[{cols_str}]_{sample_str}"
     return hashlib.md5(fingerprint.encode('utf-8')).hexdigest()
 
 
@@ -591,7 +727,9 @@ def run_full_diagnostics(
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
     split_col: Optional[str] = None,
-    drift_mode: str = 'auto'
+    drift_mode: str = 'auto',
+    time_granularity: str = 'half',
+    custom_time_ranges: Optional[List[Tuple[Any, Any]]] = None
 ) -> Dict[str, Any]:
     texts = df[text_col].astype(str).tolist()
     labels = df[label_col].astype(str).tolist()
@@ -604,10 +742,21 @@ def run_full_diagnostics(
     )
 
     drift_results = []
-    drift_meta = {'split_col': split_col, 'mode': drift_mode, 'method': '', 'is_time_split': False}
+    drift_meta = {
+        'split_col': split_col,
+        'mode': drift_mode,
+        'method': '',
+        'is_time_split': False,
+        'time_granularity': time_granularity
+    }
 
     if split_col and split_col in df.columns and split_col != text_col and split_col != label_col:
-        drift_results, extra_meta = compute_drift_by_split_col(df, text_col, split_col, mode=drift_mode)
+        drift_results, extra_meta = compute_drift_by_split_col(
+            df, text_col, split_col,
+            mode=drift_mode,
+            time_granularity=time_granularity,
+            custom_time_ranges=custom_time_ranges
+        )
         drift_meta.update(extra_meta)
     else:
         mid = len(texts) // 2

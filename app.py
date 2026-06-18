@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 from plotly.io import to_html
 from typing import Optional, Dict, Any, List
 
-from diagnostics import run_full_diagnostics, check_split_stratification, dataframe_fingerprint, is_datetime_col
+from diagnostics import run_full_diagnostics, check_split_stratification, dataframe_fingerprint, is_datetime_col, get_diagnostic_columns
 
 
 st.set_page_config(
@@ -274,6 +274,31 @@ def generate_html_report(
     bar_fig = generate_class_bar_fig(cb['class_counts'], cb['small_classes'])
 
     drift_method = drift_meta.get('method', '默认前后切分')
+    is_time_split = drift_meta.get('is_time_split', False)
+
+    extra_meta_html = ''
+    if is_time_split:
+        gran = drift_meta.get('time_granularity', 'half')
+        gran_name = {
+            'half': '前后半段',
+            'month': '月份对比',
+            'quarter': '季度对比',
+            'custom': '自定义范围'
+        }.get(gran, gran)
+        invalid = drift_meta.get('invalid_time_rows', 0)
+        valid = drift_meta.get('valid_time_rows', 0)
+        total = drift_meta.get('total_rows', 0)
+        periods = drift_meta.get('time_periods', [])
+
+        extra_meta_html = f'<p style="margin:5px 0;"><strong>⏰ 时间粒度:</strong> {gran_name}'
+        if invalid > 0:
+            extra_meta_html += f' | <strong>过滤无效日期:</strong> {invalid}/{total} 行'
+        extra_meta_html += '</p>'
+        if periods:
+            period_info = ' | '.join([str(p) for p in periods[:10]])
+            if len(periods) > 10:
+                period_info += f'...(共{len(periods)}个时间段)'
+            extra_meta_html += f'<p style="margin:5px 0;"><strong>时间段:</strong> {period_info}</p>'
 
     html = f'''<!DOCTYPE html>
 <html lang="zh-CN">
@@ -315,6 +340,7 @@ def generate_html_report(
         <p style="margin:5px 0;"><strong>📁 数据配置:</strong> 文本列 = "{text_col}"，标签列 = "{label_col}"</p>
         <p style="margin:5px 0;"><strong>📊 样本总数:</strong> {diagnostics_results['total_samples']} 条</p>
         <p style="margin:5px 0;"><strong>⚡ 漂移切分方式:</strong> {drift_method}</p>
+        {extra_meta_html}
     </div>
 
     <h2>📊 综合质量评分</h2>
@@ -379,6 +405,8 @@ def generate_html_report(
     <h2>⚡ 分布漂移检测 (JS散度)</h2>
     <p style="color:#666;">
         <strong>切分方式:</strong> {drift_method}
+        {' | <strong>时间粒度:</strong> ' + gran_name if is_time_split else ''}
+        {' | <strong>过滤无效日期:</strong> ' + str(invalid) + '/' + str(total) + ' 行' if (is_time_split and invalid > 0) else ''}
         &nbsp;&nbsp;|&nbsp;&nbsp;
         阈值: 文本长度 JS > 0.2 或 词频 JS > 0.2 视为存在显著漂移
     </p>
@@ -407,6 +435,52 @@ def get_download_link(html_content: str, filename: str = 'diagnostics_report.htm
 def render_overview_tab(df: pd.DataFrame, diag: Dict[str, Any], text_col: str, label_col: str):
     qs = diag['quality_scores']
     lim = diag.get('label_issues_meta', {})
+
+    history = st.session_state.get('diagnostics_history', [])
+    if history:
+        prev_record = history[-1]
+        prev_metrics = prev_record['metrics']
+        curr_metrics = extract_comparison_metrics(diag)
+
+        st.markdown('### 📈 与上一次诊断对比')
+        st.caption(f'上一次诊断时间: {prev_record["timestamp"]}  |  样本数: {prev_record["total_samples"]} → {curr_metrics["total_samples"]}')
+
+        metric_display = [
+            ('综合质量评分', 'quality_score', True, '%'),
+            ('CleanLab标注质量', 'cleanlab_score', True, '%'),
+            ('噪声样本比例', 'noise_ratio', False, '%'),
+            ('类别平衡得分', 'balance_score', True, '%'),
+            ('Gini不纯度', 'gini_impurity', False, ''),
+            ('小类别数量', 'num_small_classes', False, ''),
+            ('极小类别数量', 'num_tiny_classes', False, ''),
+            ('最大文本长度JS', 'max_text_length_js', False, ''),
+            ('最大词频JS', 'max_tfidf_js', False, ''),
+        ]
+
+        cols = st.columns(4)
+        for idx, (name, key, higher_better, suffix) in enumerate(metric_display):
+            with cols[idx % 4]:
+                curr_val = curr_metrics.get(key)
+                prev_val = prev_metrics.get(key)
+                if curr_val is None:
+                    curr_str = '未执行'
+                elif '%' in suffix:
+                    curr_str = f'{curr_val:.1%}'
+                elif isinstance(curr_val, float):
+                    curr_str = f'{curr_val:.4f}'
+                else:
+                    curr_str = f'{curr_val}'
+
+                diff_html = format_diff(curr_val, prev_val, suffix, higher_better)
+                st.metric(
+                    name,
+                    curr_str,
+                    help='与上一次诊断的变化'
+                )
+                if diff_html:
+                    st.markdown(diff_html, unsafe_allow_html=True)
+
+        st.markdown('---')
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -563,9 +637,13 @@ def render_label_noise_tab(df: pd.DataFrame, diag: Dict[str, Any], label_col: st
                 try:
                     split_col = st.session_state.get('drift_split_col', None)
                     drift_mode = st.session_state.get('drift_mode', 'auto')
+                    time_granularity = st.session_state.get('time_granularity', 'half')
+                    custom_ranges = st.session_state.get('custom_time_ranges')
                     new_diag = run_full_diagnostics(
                         modified_df, text_col, label_col,
-                        split_col=split_col, drift_mode=drift_mode
+                        split_col=split_col, drift_mode=drift_mode,
+                        time_granularity=time_granularity,
+                        custom_time_ranges=custom_ranges
                     )
                     st.session_state['diagnostics'] = new_diag
                     st.success('🎉 重新诊断完成！所有数据已更新（沿用原有漂移切分设置）')
@@ -781,29 +859,119 @@ def render_distribution_drift_tab(df: pd.DataFrame, diag: Dict[str, Any], text_c
             key='drift_mode_select'
         )
 
+    actual_split_col = None if split_col_choice == '(默认: 前后半切分)' else split_col_choice
+    is_time_col = actual_split_col and is_datetime_col(df[actual_split_col], actual_split_col)
+
+    if is_time_col:
+        col_t1, col_t2 = st.columns(2)
+        with col_t1:
+            current_gran = st.session_state.get('time_granularity', 'half')
+            gran_options = [
+                ('half', '前后半段（默认）'),
+                ('month', '按月份对比'),
+                ('quarter', '按季度对比'),
+                ('custom', '自定义时间范围')
+            ]
+            gran_display = [g[1] for g in gran_options]
+            gran_values = [g[0] for g in gran_options]
+            default_gran_idx = gran_values.index(current_gran) if current_gran in gran_values else 0
+            time_gran_display = st.selectbox(
+                '时间切分粒度',
+                options=gran_display,
+                index=default_gran_idx,
+                key='time_granularity_select'
+            )
+            time_granularity = gran_values[gran_display.index(time_gran_display)]
+        with col_t2:
+            st.write('')
+            st.caption('时间列会自动过滤空日期，只用有效日期参与对比')
+
+        custom_ranges = None
+        if time_granularity == 'custom':
+            st.markdown('**自定义时间范围对比（至少选2个范围）**')
+            dt_series = pd.to_datetime(df[actual_split_col], errors='coerce')
+            valid_dt = dt_series.dropna()
+            if len(valid_dt) > 0:
+                min_dt = valid_dt.min().date()
+                max_dt = valid_dt.max().date()
+                col_r1, col_r2 = st.columns(2)
+                with col_r1:
+                    range1_start = st.date_input('范围1 开始', value=min_dt, min_value=min_dt, max_value=max_dt, key='r1s')
+                    range1_end = st.date_input('范围1 结束', value=max_dt, min_value=min_dt, max_value=max_dt, key='r1e')
+                with col_r2:
+                    range2_start = st.date_input('范围2 开始', value=min_dt, min_value=min_dt, max_value=max_dt, key='r2s')
+                    range2_end = st.date_input('范围2 结束', value=max_dt, min_value=min_dt, max_value=max_dt, key='r2e')
+                custom_ranges = [(range1_start, range1_end), (range2_start, range2_end)]
+                if st.checkbox('添加第3个对比范围', key='add_range3'):
+                    col_r3, _ = st.columns(2)
+                    with col_r3:
+                        range3_start = st.date_input('范围3 开始', value=min_dt, min_value=min_dt, max_value=max_dt, key='r3s')
+                        range3_end = st.date_input('范围3 结束', value=max_dt, min_value=min_dt, max_value=max_dt, key='r3e')
+                    custom_ranges.append((range3_start, range3_end))
+                st.session_state['custom_time_ranges'] = custom_ranges
+            else:
+                st.warning('没有有效的日期数据，请检查时间列格式')
+        else:
+            st.session_state['custom_time_ranges'] = None
+    else:
+        time_granularity = 'half'
+        st.session_state['time_granularity'] = 'half'
+        st.session_state['custom_time_ranges'] = None
+
+    if is_time_col:
+        st.session_state['time_granularity'] = time_granularity
+
     mode_map = {
         'auto（自动选择）': 'auto',
         'pairwise（两两对比）': 'pairwise',
         'first_vs_rest（第一个vs其他）': 'first_vs_rest'
     }
     selected_mode = mode_map.get(drift_mode, 'auto')
-    actual_split_col = None if split_col_choice == '(默认: 前后半切分)' else split_col_choice
 
     prev_split_col = st.session_state.get('last_drift_split_col', '__none__')
     prev_mode = st.session_state.get('last_drift_mode', '__none__')
+    prev_gran = st.session_state.get('last_time_granularity', '__none__')
+    prev_ranges = st.session_state.get('last_custom_ranges', '__none__')
 
     st.session_state['drift_split_col'] = actual_split_col
     st.session_state['drift_mode'] = selected_mode
 
-    if actual_split_col != prev_split_col or selected_mode != prev_mode:
+    ranges_changed = False
+    if time_granularity == 'custom' and custom_ranges:
+        ranges_str = str(custom_ranges)
+        if ranges_str != str(prev_ranges):
+            ranges_changed = True
+            st.session_state['last_custom_ranges'] = ranges_str
+
+    if (actual_split_col != prev_split_col
+            or selected_mode != prev_mode
+            or (is_time_col and time_granularity != prev_gran)
+            or ranges_changed):
         st.session_state['last_drift_split_col'] = actual_split_col
         st.session_state['last_drift_mode'] = selected_mode
+        if is_time_col:
+            st.session_state['last_time_granularity'] = time_granularity
         st.session_state.pop('diagnostics', None)
         st.rerun()
 
     drifts = diag['distribution_drift']
 
     st.caption(f'当前切分方式: {drift_meta.get("method", "未设置")}')
+
+    if drift_meta.get('is_time_split'):
+        invalid = drift_meta.get('invalid_time_rows', 0)
+        valid = drift_meta.get('valid_time_rows', 0)
+        total = drift_meta.get('total_rows', len(df))
+        if invalid > 0:
+            st.info(f'ℹ️ 时间列有 {invalid}/{total} 行空日期或无效日期已被过滤，仅用 {valid} 行有效数据参与对比')
+        periods = drift_meta.get('time_periods', [])
+        if periods:
+            period_counts = []
+            for d in drifts:
+                period_counts.append(f'{d["split_label_a"]}: {d["size_a"]}条')
+                period_counts.append(f'{d["split_label_b"]}: {d["size_b"]}条')
+            unique_counts = list(dict.fromkeys(period_counts))
+            st.caption('各时间段样本数: ' + ' | '.join(unique_counts))
 
     if not drifts:
         st.info('未检测到有效的漂移对比组（可能样本太少或切分列取值不足）')
@@ -832,11 +1000,58 @@ def render_distribution_drift_tab(df: pd.DataFrame, diag: Dict[str, Any], text_c
 
 
 def get_dataset_fingerprint(df: pd.DataFrame, text_col: str, label_col: str,
-                            split_col: Optional[str], drift_mode: str) -> str:
+                            split_col: Optional[str], drift_mode: str,
+                            time_granularity: str = 'half') -> str:
     """生成数据集的指纹，用于判断是否需要重新诊断"""
     base_fp = dataframe_fingerprint(df, text_col, label_col)
-    extra = f'_{split_col}_{drift_mode}'
+    extra = f'_{split_col}_{drift_mode}_{time_granularity}'
     return hashlib.md5((base_fp + extra).encode('utf-8')).hexdigest()
+
+
+def extract_comparison_metrics(diag: Dict[str, Any]) -> Dict[str, Any]:
+    """从诊断结果中提取可对比的关键指标"""
+    qs = diag.get('quality_scores', {})
+    cb = diag.get('class_balance', {})
+    drifts = diag.get('distribution_drift', [])
+
+    max_js_len = max((d.get('text_length_js', 0) for d in drifts), default=0)
+    max_js_tf = max((d.get('tfidf_js', 0) for d in drifts), default=0)
+
+    return {
+        'quality_score': qs.get('quality_score'),
+        'cleanlab_score': qs.get('cleanlab_score'),
+        'noise_ratio': qs.get('noise_ratio'),
+        'balance_score': qs.get('balance_score'),
+        'gini_impurity': cb.get('gini_impurity'),
+        'num_classes': cb.get('num_classes'),
+        'num_small_classes': len(cb.get('small_classes', {})),
+        'num_tiny_classes': len(cb.get('tiny_classes', {})),
+        'max_text_length_js': max_js_len,
+        'max_tfidf_js': max_js_tf,
+        'num_drift_groups': len(drifts),
+        'total_samples': diag.get('total_samples')
+    }
+
+
+def format_diff(current: Any, previous: Any, suffix: str = '', is_higher_better: bool = True) -> str:
+    """格式化两个值的差异，返回带箭头的字符串"""
+    if current is None or previous is None:
+        return ''
+    try:
+        c = float(current)
+        p = float(previous)
+        diff = c - p
+        if abs(diff) < 1e-8:
+            return '—'
+        if diff > 0:
+            arrow = '↑' if is_higher_better else '↑⚠️'
+            color = 'green' if is_higher_better else 'red'
+        else:
+            arrow = '↓' if is_higher_better else '↓✅'
+            color = 'red' if is_higher_better else 'green'
+        return f'<span style="color:{color};font-weight:bold;">{arrow} {abs(diff):.2%}{suffix}</span>'
+    except Exception:
+        return ''
 
 
 def main():
@@ -847,6 +1062,8 @@ def main():
         st.session_state['df'] = None
     if 'diagnostics' not in st.session_state:
         st.session_state['diagnostics'] = None
+    if 'diagnostics_history' not in st.session_state:
+        st.session_state['diagnostics_history'] = []
     if 'text_col' not in st.session_state:
         st.session_state['text_col'] = None
     if 'label_col' not in st.session_state:
@@ -859,6 +1076,10 @@ def main():
         st.session_state['drift_split_col'] = None
     if 'drift_mode' not in st.session_state:
         st.session_state['drift_mode'] = 'auto'
+    if 'time_granularity' not in st.session_state:
+        st.session_state['time_granularity'] = 'half'
+    if 'custom_time_ranges' not in st.session_state:
+        st.session_state['custom_time_ranges'] = None
 
     with st.sidebar:
         st.header('📂 数据输入')
@@ -959,7 +1180,8 @@ def main():
             current_fp = get_dataset_fingerprint(
                 df, text_col, label_col,
                 st.session_state.get('drift_split_col'),
-                st.session_state.get('drift_mode', 'auto')
+                st.session_state.get('drift_mode', 'auto'),
+                st.session_state.get('time_granularity', 'half')
             )
 
             is_new_data = (
@@ -1010,11 +1232,28 @@ def main():
             try:
                 split_col = st.session_state.get('drift_split_col')
                 drift_mode = st.session_state.get('drift_mode', 'auto')
+                time_granularity = st.session_state.get('time_granularity', 'half')
+                custom_ranges = st.session_state.get('custom_time_ranges')
                 diag = run_full_diagnostics(
                     df, text_col, label_col,
                     split_col=split_col,
-                    drift_mode=drift_mode
+                    drift_mode=drift_mode,
+                    time_granularity=time_granularity,
+                    custom_time_ranges=custom_ranges
                 )
+                prev_diag = st.session_state.get('diagnostics')
+                if prev_diag is not None:
+                    history = st.session_state.get('diagnostics_history', [])
+                    history.append({
+                        'timestamp': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'metrics': extract_comparison_metrics(prev_diag),
+                        'text_col': st.session_state.get('text_col'),
+                        'label_col': st.session_state.get('label_col'),
+                        'total_samples': prev_diag.get('total_samples')
+                    })
+                    if len(history) > 2:
+                        history = history[-2:]
+                    st.session_state['diagnostics_history'] = history
                 st.session_state['diagnostics'] = diag
                 st.toast('✅ 诊断完成！', icon='🎉')
             except Exception as e:
