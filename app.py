@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 from plotly.io import to_html
 from typing import Optional, Dict, Any, List
 
-from diagnostics import run_full_diagnostics, check_split_stratification, dataframe_fingerprint
+from diagnostics import run_full_diagnostics, check_split_stratification, dataframe_fingerprint, is_datetime_col
 
 
 st.set_page_config(
@@ -67,13 +67,18 @@ def get_text_and_label_candidates(df: pd.DataFrame):
 
 def get_split_col_candidates(df: pd.DataFrame, text_col: str, label_col: str) -> List[str]:
     candidates = []
+    datetime_candidates = []
     for col in df.columns:
         if col == text_col or col == label_col:
             continue
-        nunique = df[col].nunique()
+        series = df[col]
+        if is_datetime_col(series, col):
+            datetime_candidates.append(col)
+            continue
+        nunique = series.nunique()
         if 2 <= nunique <= min(20, len(df) * 0.5):
             candidates.append(col)
-    return candidates
+    return candidates + datetime_candidates
 
 
 def highlight_rows(row):
@@ -546,9 +551,12 @@ def render_label_noise_tab(df: pd.DataFrame, diag: Dict[str, Any], label_col: st
             modified_df.loc[selected_indices, label_col] = new_label
             st.session_state['df'] = modified_df
             st.session_state['modified_df'] = modified_df
+            preserved_split_col = st.session_state.get('drift_split_col', None)
+            preserved_drift_mode = st.session_state.get('drift_mode', 'auto')
             st.session_state.pop('diagnostics', None)
             st.session_state.pop('split_result', None)
-            st.session_state.pop('drift_split_col', None)
+            st.session_state['drift_split_col'] = preserved_split_col
+            st.session_state['drift_mode'] = preserved_drift_mode
             st.success(f'✅ 已将 {len(selected_indices)} 条样本的标签修正为 "{new_label}"，正在重新诊断...')
 
             with st.spinner('🔄 基于修正后的数据重新运行完整诊断...'):
@@ -560,7 +568,7 @@ def render_label_noise_tab(df: pd.DataFrame, diag: Dict[str, Any], label_col: st
                         split_col=split_col, drift_mode=drift_mode
                     )
                     st.session_state['diagnostics'] = new_diag
-                    st.success('🎉 重新诊断完成！所有数据已更新')
+                    st.success('🎉 重新诊断完成！所有数据已更新（沿用原有漂移切分设置）')
                     st.balloons()
                 except Exception as e:
                     st.error(f'重新诊断失败: {str(e)}')
@@ -743,21 +751,33 @@ def render_distribution_drift_tab(df: pd.DataFrame, diag: Dict[str, Any], text_c
 
     col_s1, col_s2 = st.columns(2)
     with col_s1:
-        default_idx = 0
-        if 'drift_split_col' in st.session_state and st.session_state['drift_split_col'] in split_candidates:
-            default_idx = split_candidates.index(st.session_state['drift_split_col'])
+        default_option = '(默认: 前后半切分)'
+        current_split = st.session_state.get('drift_split_col', None)
+        if current_split and current_split in split_candidates:
+            default_option = current_split
+        options_list = ['(默认: 前后半切分)'] + split_candidates
+        default_idx = options_list.index(default_option) if default_option in options_list else 0
         split_col_choice = st.selectbox(
             '选择漂移切分列（来源/时间/split等）',
-            options=['(默认: 前后半切分)'] + split_candidates,
-            index=default_idx if split_candidates else 0,
-            help='选择一个列来划分两组数据，比较它们的文本长度和词频分布差异',
+            options=options_list,
+            index=default_idx,
+            help='选择一个列来划分两组数据，比较它们的文本长度和词频分布差异。时间类列会自动按时间前后段切分。',
             key='drift_split_col_select'
         )
     with col_s2:
+        current_mode = st.session_state.get('drift_mode', 'auto')
+        mode_display_map = {
+            'auto': 'auto（自动选择）',
+            'pairwise': 'pairwise（两两对比）',
+            'first_vs_rest': 'first_vs_rest（第一个vs其他）'
+        }
+        mode_options = list(mode_display_map.values())
+        default_mode_display = mode_display_map.get(current_mode, 'auto（自动选择）')
+        mode_idx = mode_options.index(default_mode_display) if default_mode_display in mode_options else 0
         drift_mode = st.selectbox(
             '对比模式',
-            options=['auto（自动选择）', 'pairwise（两两对比）', 'first_vs_rest（第一个vs其他）'],
-            index=0,
+            options=mode_options,
+            index=mode_idx,
             key='drift_mode_select'
         )
 
@@ -769,11 +789,11 @@ def render_distribution_drift_tab(df: pd.DataFrame, diag: Dict[str, Any], text_c
     selected_mode = mode_map.get(drift_mode, 'auto')
     actual_split_col = None if split_col_choice == '(默认: 前后半切分)' else split_col_choice
 
-    st.session_state['drift_split_col'] = actual_split_col
-    st.session_state['drift_mode'] = selected_mode
-
     prev_split_col = st.session_state.get('last_drift_split_col', '__none__')
     prev_mode = st.session_state.get('last_drift_mode', '__none__')
+
+    st.session_state['drift_split_col'] = actual_split_col
+    st.session_state['drift_mode'] = selected_mode
 
     if actual_split_col != prev_split_col or selected_mode != prev_mode:
         st.session_state['last_drift_split_col'] = actual_split_col
@@ -886,6 +906,8 @@ def main():
                 n = 500
                 labels = np.random.choice(['正面', '负面', '中性'], size=n, p=[0.5, 0.3, 0.2])
                 sources = np.random.choice(['微博', '知乎', '小红书'], size=n, p=[0.4, 0.35, 0.25])
+                date_range = pd.date_range(start='2024-01-01', end='2024-12-31', periods=n)
+                created_at = np.random.permutation(date_range)
                 texts = []
                 for lbl in labels:
                     if lbl == '正面':
@@ -905,11 +927,16 @@ def main():
                     other_labels = [l for l in ['正面', '负面', '中性'] if l != labels[idx]]
                     labels_with_noise[idx] = np.random.choice(other_labels)
 
-                df = pd.DataFrame({'text': texts, 'label': labels_with_noise, 'source': sources})
+                df = pd.DataFrame({
+                    'text': texts,
+                    'label': labels_with_noise,
+                    'source': sources,
+                    'created_at': created_at
+                })
 
                 dup_idx = np.random.choice(n, size=15, replace=False)
                 df.loc[dup_idx, 'text'] = df.loc[dup_idx, 'text']
-                st.success(f'✅ 已生成 {len(df)} 条示例数据（含约8%噪声，含source来源列）')
+                st.success(f'✅ 已生成 {len(df)} 条示例数据（含约8%噪声，含source来源列和created_at时间列）')
 
         if df is not None:
             text_candidates, label_candidates = get_text_and_label_candidates(df)
@@ -941,12 +968,19 @@ def main():
             )
 
             if is_new_data:
+                prev_split_col = st.session_state.get('drift_split_col', None)
+                prev_drift_mode = st.session_state.get('drift_mode', 'auto')
+                split_candidates_new = get_split_col_candidates(df, text_col, label_col)
+                if prev_split_col and prev_split_col not in split_candidates_new:
+                    prev_split_col = None
                 st.session_state['df'] = df
                 st.session_state['text_col'] = text_col
                 st.session_state['label_col'] = label_col
                 st.session_state['data_fingerprint'] = current_fp
                 st.session_state.pop('diagnostics', None)
                 st.session_state.pop('split_result', None)
+                st.session_state['drift_split_col'] = prev_split_col
+                st.session_state['drift_mode'] = prev_drift_mode
                 st.session_state['modified_df'] = None
 
             st.info('📊 选择文本列和标签列后将自动开始诊断')

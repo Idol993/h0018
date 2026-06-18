@@ -12,6 +12,58 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
 
 
+DATETIME_KEYWORDS = [
+    'time', 'date', 'datetime', 'timestamp', 'created_at', 'updated_at',
+    'published_at', 'recorded_at', '时间', '日期', '创建时间', '更新时间',
+    '发布时间', '记录时间', 'create_time', 'update_time', 'pub_time'
+]
+
+
+def is_datetime_col(series: pd.Series, col_name: str = '') -> bool:
+    """判断一列是否是时间/日期类型"""
+    name_lower = str(col_name).lower()
+    has_keyword = any(kw.lower() in name_lower for kw in DATETIME_KEYWORDS)
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return True
+
+    if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+        sample = series.dropna().astype(str).head(20)
+        if len(sample) < 3:
+            return has_keyword
+        try:
+            parsed = pd.to_datetime(sample, errors='coerce')
+            valid_ratio = parsed.notna().mean()
+            if valid_ratio >= 0.8:
+                date_pattern = re.compile(
+                    r'(\d{4}[-/年.]\d{1,2}[-/月.]\d{1,2})'
+                    r'|(\d{1,2}[-/月.]\d{1,2}[-/年.]\d{2,4})'
+                    r'|(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})'
+                    r'|(\d{10,13})',
+                    re.IGNORECASE
+                )
+                pattern_match_ratio = sum(
+                    1 for s in sample if date_pattern.search(s.strip())
+                ) / len(sample)
+                if has_keyword and valid_ratio >= 0.5:
+                    return True
+                if valid_ratio >= 0.9 and pattern_match_ratio >= 0.5:
+                    return True
+                return False
+            return False
+        except Exception:
+            return has_keyword
+    return has_keyword
+
+
+def parse_datetime_safe(series: pd.Series) -> pd.Series:
+    """安全地将一列转为datetime，失败返回NaT"""
+    try:
+        return pd.to_datetime(series, errors='coerce', utc=False)
+    except Exception:
+        return pd.Series([pd.NaT] * len(series))
+
+
 def detect_label_issues(
     texts: List[str],
     labels: List[str],
@@ -272,7 +324,7 @@ def compute_drift_by_split_col(
     text_col: str,
     split_col: str,
     mode: str = 'pairwise'
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     根据指定列计算分布漂移
 
@@ -280,21 +332,49 @@ def compute_drift_by_split_col(
       - 'pairwise': 两两比较所有不同取值
       - 'first_vs_rest': 第一个取值 vs 其他所有
       - 'auto': 若取值<=5用pairwise，否则first_vs_rest
+      - 时间列: 自动按时间前后段切分
+
+    Returns:
+        (drift_results, meta_info
     """
     results = []
+    meta = {'method': '', 'is_time_split': False}
     if split_col not in df.columns:
-        return results
+        return results, meta
 
-    series = df[split_col].dropna()
-    unique_vals = series.unique().tolist()
+    series = df[split_col]
+
+    if is_datetime_col(series, split_col):
+        dt_series = parse_datetime_safe(series)
+        valid_mask = dt_series.notna()
+        if valid_mask.sum() >= 10:
+            sorted_idx = np.argsort(dt_series[valid_mask])
+            n_valid = len(sorted_idx)
+            mid = n_valid // 2
+            first_half_idx = sorted_idx[:mid]
+            second_half_idx = sorted_idx[mid:]
+            if len(first_half_idx) > 0 and len(second_half_idx) > 0:
+                texts_a = df.iloc[first_half_idx][text_col].astype(str).tolist()
+                texts_b = df.iloc[second_half_idx][text_col].astype(str).tolist()
+                drift = check_distribution_drift(
+                    texts_a, texts_b,
+                    label_a='时间前段',
+                    label_b='时间后段',
+                    split_col_name=split_col
+                )
+                results.append(drift)
+                meta['method'] = f'按时间列[{split_col}]前后段切分'
+                meta['is_time_split'] = True
+                return results, meta
+
+    series_clean = series.dropna()
+    unique_vals = series_clean.unique().tolist()
 
     if len(unique_vals) < 2:
-        return results
+        return results, meta
 
     if mode == 'auto':
         mode = 'pairwise' if len(unique_vals) <= 5 else 'first_vs_rest'
-
-    texts_all = df[text_col].astype(str).tolist()
 
     if mode == 'first_vs_rest':
         first_val = unique_vals[0]
@@ -308,6 +388,7 @@ def compute_drift_by_split_col(
             split_col_name=split_col
         )
         results.append(drift)
+        meta['method'] = f'按列[{split_col}]切分 (first_vs_rest)'
 
     else:
         for i in range(len(unique_vals)):
@@ -324,8 +405,9 @@ def compute_drift_by_split_col(
                         split_col_name=split_col
                     )
                     results.append(drift)
+        meta['method'] = f'按列[{split_col}]切分 (pairwise)'
 
-    return results
+    return results, meta
 
 
 def check_text_quality(texts: List[str]) -> Dict[str, Any]:
@@ -482,14 +564,22 @@ def generate_augmentation_suggestions(class_balance: Dict[str, Any]) -> Dict[str
 
 
 def dataframe_fingerprint(df: pd.DataFrame, text_col: str, label_col: str) -> str:
-    """计算数据指纹，用于缓存判断"""
-    sample_text = ''
-    sample_label = ''
-    if len(df) > 0:
-        sample_text = str(df.iloc[0][text_col]) if text_col in df.columns else ''
-        sample_label = str(df.iloc[0][label_col]) if label_col in df.columns else ''
+    """计算数据指纹，用于缓存判断。采样多行列内容，避免内容不同但首行相同的误判"""
+    n = len(df)
+    if n == 0:
+        return hashlib.md5(f"empty_{df.columns.tolist()}".encode('utf-8')).hexdigest()
 
-    fingerprint = f"{len(df)}_{df.columns.tolist()}_{sample_text[:50]}_{sample_label}"
+    sample_size = min(50, n)
+    sample_indices = np.linspace(0, n - 1, sample_size, dtype=int).tolist()
+
+    sample_parts = []
+    for idx in sample_indices:
+        t = str(df.iloc[idx][text_col]) if text_col in df.columns else ''
+        l = str(df.iloc[idx][label_col]) if label_col in df.columns else ''
+        sample_parts.append(f"{idx}:{t[:30]}:{l}")
+
+    sample_str = '|'.join(sample_parts)
+    fingerprint = f"{n}_{df.columns.tolist()}_{sample_str}"
     return hashlib.md5(fingerprint.encode('utf-8')).hexdigest()
 
 
@@ -514,11 +604,11 @@ def run_full_diagnostics(
     )
 
     drift_results = []
-    drift_meta = {'split_col': split_col, 'mode': drift_mode, 'method': ''}
+    drift_meta = {'split_col': split_col, 'mode': drift_mode, 'method': '', 'is_time_split': False}
 
     if split_col and split_col in df.columns and split_col != text_col and split_col != label_col:
-        drift_results = compute_drift_by_split_col(df, text_col, split_col, mode=drift_mode)
-        drift_meta['method'] = f'按列[{split_col}]切分 ({drift_mode})'
+        drift_results, extra_meta = compute_drift_by_split_col(df, text_col, split_col, mode=drift_mode)
+        drift_meta.update(extra_meta)
     else:
         mid = len(texts) // 2
         if mid > 0 and len(texts) >= 20:
