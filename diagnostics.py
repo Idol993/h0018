@@ -1,4 +1,5 @@
 import re
+import hashlib
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Optional, Any
@@ -16,19 +17,68 @@ def detect_label_issues(
     labels: List[str],
     n_splits: int = 5,
     random_state: int = 42
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    检测标签噪声，返回 (问题样本DataFrame, 诊断元信息)
+    元信息包含：是否降级、使用的折数、降级原因
+    """
+    meta = {
+        'skipped': False,
+        'degraded': False,
+        'n_splits_used': n_splits,
+        'reason': '',
+        'method': 'cleanlab_cv'
+    }
+
+    n_samples = len(texts)
+    if n_samples < 10:
+        meta['skipped'] = True
+        meta['reason'] = f'样本数太少({n_samples}<10)，跳过标签噪声检测'
+        return pd.DataFrame(columns=[
+            'index', 'text', 'current_label', 'suggested_label',
+            'confidence', 'original_confidence', 'score_gap'
+        ]), meta
+
     label_encoder = LabelEncoder()
     y_encoded = label_encoder.fit_transform(labels)
+    n_classes = len(label_encoder.classes_)
+
+    if n_classes < 2:
+        meta['skipped'] = True
+        meta['reason'] = f'类别数太少({n_classes})，无法进行标签噪声检测'
+        return pd.DataFrame(columns=[
+            'index', 'text', 'current_label', 'suggested_label',
+            'confidence', 'original_confidence', 'score_gap'
+        ]), meta
+
+    label_counts = pd.Series(labels).value_counts()
+    min_class_count = label_counts.min()
+
+    actual_splits = n_splits
+    if min_class_count < actual_splits:
+        actual_splits = max(2, min_class_count)
+        if actual_splits < 2:
+            meta['skipped'] = True
+            meta['reason'] = f'最小类别仅{min_class_count}个样本，无法进行分层交叉验证'
+            return pd.DataFrame(columns=[
+                'index', 'text', 'current_label', 'suggested_label',
+                'confidence', 'original_confidence', 'score_gap'
+            ]), meta
+        meta['degraded'] = True
+        meta['n_splits_used'] = actual_splits
+        meta['reason'] = f'最小类别仅{min_class_count}个样本，折数自动从{n_splits}调整为{actual_splits}'
+
+    meta['n_splits_used'] = actual_splits
 
     try:
         from cleanlab.filter import find_label_issues
 
         pipeline = Pipeline([
-            ('tfidf', TfidfVectorizer(max_features=5000, ngram_range=(1, 2))),
-            ('clf', LogisticRegression(max_iter=1000, random_state=random_state))
+            ('tfidf', TfidfVectorizer(max_features=min(5000, n_samples), ngram_range=(1, 2))),
+            ('clf', LogisticRegression(max_iter=1000, random_state=random_state, C=1.0))
         ])
 
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+        skf = StratifiedKFold(n_splits=actual_splits, shuffle=True, random_state=random_state)
         pred_probs = cross_val_predict(pipeline, texts, y_encoded, cv=skf, method='predict_proba')
 
         issues_mask = find_label_issues(
@@ -61,15 +111,16 @@ def detect_label_issues(
             })
 
         results.sort(key=lambda x: x['score_gap'], reverse=True)
-        return pd.DataFrame(results)
+        return pd.DataFrame(results), meta
 
     except ImportError:
+        meta['method'] = 'simple_cv'
         pipeline = Pipeline([
-            ('tfidf', TfidfVectorizer(max_features=5000, ngram_range=(1, 2))),
+            ('tfidf', TfidfVectorizer(max_features=min(5000, n_samples), ngram_range=(1, 2))),
             ('clf', LogisticRegression(max_iter=1000, random_state=random_state))
         ])
 
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+        skf = StratifiedKFold(n_splits=actual_splits, shuffle=True, random_state=random_state)
         pred_probs = cross_val_predict(pipeline, texts, y_encoded, cv=skf, method='predict_proba')
 
         results = []
@@ -91,7 +142,7 @@ def detect_label_issues(
                     })
 
         results.sort(key=lambda x: x['score_gap'], reverse=True)
-        return pd.DataFrame(results)
+        return pd.DataFrame(results), meta
 
 
 def compute_gini_impurity(counts: np.ndarray) -> float:
@@ -117,6 +168,7 @@ def analyze_class_balance(labels: List[str]) -> Dict[str, Any]:
         'min_count': int(counts.min()),
         'max_min_ratio': round(counts.max() / counts.min(), 2) if counts.min() > 0 else float('inf'),
         'small_classes': {k: int(v) for k, v in counts.items() if v < 50},
+        'tiny_classes': {k: int(v) for k, v in counts.items() if v < 5},
         'suggestions': []
     }
 
@@ -130,7 +182,12 @@ def analyze_class_balance(labels: List[str]) -> Dict[str, Any]:
                 '类别存在一定不平衡，建议考虑使用类别权重（class_weight）或数据增强策略'
             )
 
-    if len(result['small_classes']) > 0:
+    if len(result['tiny_classes']) > 0:
+        tiny_cls = ', '.join(result['tiny_classes'].keys())
+        result['suggestions'].append(
+            f'⚠️ 以下类别样本极少 (<5): {tiny_cls}，标签噪声检测可能已降级或跳过，强烈建议补充数据'
+        )
+    elif len(result['small_classes']) > 0:
         small_cls = ', '.join(result['small_classes'].keys())
         result['suggestions'].append(
             f'以下类别样本数较少 (<50): {small_cls}，建议进行文本增强（同义词替换、回译等）'
@@ -142,8 +199,12 @@ def analyze_class_balance(labels: List[str]) -> Dict[str, Any]:
 def jensen_shannon_divergence(p: np.ndarray, q: np.ndarray) -> float:
     p = np.asarray(p, dtype=float)
     q = np.asarray(q, dtype=float)
-    p = p / p.sum() if p.sum() > 0 else p
-    q = q / q.sum() if q.sum() > 0 else q
+    p_sum = p.sum()
+    q_sum = q.sum()
+    if p_sum == 0 or q_sum == 0:
+        return 0.0
+    p = p / p_sum
+    q = q / q_sum
     return jensenshannon(p, q) ** 2
 
 
@@ -151,43 +212,120 @@ def check_distribution_drift(
     texts_a: List[str],
     texts_b: List[str],
     label_a: str = 'split_A',
-    label_b: str = 'split_B'
+    label_b: str = 'split_B',
+    split_col_name: Optional[str] = None
 ) -> Dict[str, Any]:
     len_a = [len(str(t)) for t in texts_a]
     len_b = [len(str(t)) for t in texts_b]
 
-    bins = np.linspace(0, max(max(len_a), max(len_b), 100), 30)
-    hist_a, _ = np.histogram(len_a, bins=bins, density=True)
-    hist_b, _ = np.histogram(len_b, bins=bins, density=True)
+    max_len = max(max(len_a) if len_a else 0, max(len_b) if len_b else 0, 100)
+    bins = np.linspace(0, max_len, 30)
+    hist_a, _ = np.histogram(len_a, bins=bins, density=True) if len_a else (np.zeros(29), bins)
+    hist_b, _ = np.histogram(len_b, bins=bins, density=True) if len_b else (np.zeros(29), bins)
     hist_a = hist_a + 1e-10
     hist_b = hist_b + 1e-10
     js_len = jensen_shannon_divergence(hist_a, hist_b)
 
     try:
         all_texts = list(texts_a) + list(texts_b)
-        vectorizer = TfidfVectorizer(max_features=1000)
+        if not all_texts:
+            raise ValueError('no texts')
+        vectorizer = TfidfVectorizer(max_features=min(1000, len(all_texts)))
         tfidf = vectorizer.fit_transform(all_texts)
 
-        tfidf_a = tfidf[:len(texts_a)].mean(axis=0).A1
-        tfidf_b = tfidf[len(texts_a):].mean(axis=0).A1
-        tfidf_a = tfidf_a + 1e-10
-        tfidf_b = tfidf_b + 1e-10
-        js_tfidf = jensen_shannon_divergence(tfidf_a, tfidf_b)
+        if len(texts_a) > 0 and len(texts_b) > 0:
+            tfidf_a = tfidf[:len(texts_a)].mean(axis=0).A1
+            tfidf_b = tfidf[len(texts_a):].mean(axis=0).A1
+            tfidf_a = tfidf_a + 1e-10
+            tfidf_b = tfidf_b + 1e-10
+            js_tfidf = jensen_shannon_divergence(tfidf_a, tfidf_b)
+        else:
+            js_tfidf = 0.0
     except Exception:
         js_tfidf = 0.0
+
+    warnings = []
+    if js_len > 0.2:
+        warnings.append(f'文本长度分布漂移较大 (JS={js_len:.4f})')
+    if js_tfidf > 0.2:
+        warnings.append(f'词频分布漂移较大 (JS={js_tfidf:.4f})')
 
     return {
         'split_label_a': label_a,
         'split_label_b': label_b,
+        'split_col_name': split_col_name,
+        'size_a': len(texts_a),
+        'size_b': len(texts_b),
         'text_length_js': round(float(js_len), 4),
         'tfidf_js': round(float(js_tfidf), 4),
-        'avg_len_a': round(float(np.mean(len_a)), 2),
-        'avg_len_b': round(float(np.mean(len_b)), 2),
+        'avg_len_a': round(float(np.mean(len_a)), 2) if len_a else 0,
+        'avg_len_b': round(float(np.mean(len_b)), 2) if len_b else 0,
         'len_hist_bins': bins.tolist(),
         'len_hist_a': hist_a.tolist(),
         'len_hist_b': hist_b.tolist(),
-        'warnings': []
+        'warnings': warnings
     }
+
+
+def compute_drift_by_split_col(
+    df: pd.DataFrame,
+    text_col: str,
+    split_col: str,
+    mode: str = 'pairwise'
+) -> List[Dict[str, Any]]:
+    """
+    根据指定列计算分布漂移
+
+    mode:
+      - 'pairwise': 两两比较所有不同取值
+      - 'first_vs_rest': 第一个取值 vs 其他所有
+      - 'auto': 若取值<=5用pairwise，否则first_vs_rest
+    """
+    results = []
+    if split_col not in df.columns:
+        return results
+
+    series = df[split_col].dropna()
+    unique_vals = series.unique().tolist()
+
+    if len(unique_vals) < 2:
+        return results
+
+    if mode == 'auto':
+        mode = 'pairwise' if len(unique_vals) <= 5 else 'first_vs_rest'
+
+    texts_all = df[text_col].astype(str).tolist()
+
+    if mode == 'first_vs_rest':
+        first_val = unique_vals[0]
+        mask_first = df[split_col] == first_val
+        texts_a = df.loc[mask_first, text_col].astype(str).tolist()
+        texts_b = df.loc[~mask_first, text_col].astype(str).tolist()
+        drift = check_distribution_drift(
+            texts_a, texts_b,
+            label_a=str(first_val),
+            label_b='其他',
+            split_col_name=split_col
+        )
+        results.append(drift)
+
+    else:
+        for i in range(len(unique_vals)):
+            for j in range(i + 1, len(unique_vals)):
+                val_a = unique_vals[i]
+                val_b = unique_vals[j]
+                texts_a = df[df[split_col] == val_a][text_col].astype(str).tolist()
+                texts_b = df[df[split_col] == val_b][text_col].astype(str).tolist()
+                if len(texts_a) > 0 and len(texts_b) > 0:
+                    drift = check_distribution_drift(
+                        texts_a, texts_b,
+                        label_a=str(val_a),
+                        label_b=str(val_b),
+                        split_col_name=split_col
+                    )
+                    results.append(drift)
+
+    return results
 
 
 def check_text_quality(texts: List[str]) -> Dict[str, Any]:
@@ -263,6 +401,7 @@ def check_split_stratification(
             stratify=[labels[i] for i in temp_indices],
             random_state=random_state
         )
+        stratify_ok = True
     except ValueError:
         train_indices, temp_indices = train_test_split(
             list(range(len(labels))),
@@ -274,6 +413,7 @@ def check_split_stratification(
             test_size=(1 - val_relative),
             random_state=random_state
         )
+        stratify_ok = False
 
     original_counts = pd.Series(labels).value_counts(normalize=True).sort_index()
 
@@ -285,6 +425,9 @@ def check_split_stratification(
 
     stratification_report = {}
     all_warnings = []
+
+    if not stratify_ok:
+        all_warnings.append('⚠️ 部分类别样本太少，无法进行严格分层抽样，分布偏差可能较大')
 
     for split_name, split_labels in splits.items():
         split_counts = pd.Series(split_labels).value_counts(normalize=True).sort_index()
@@ -322,6 +465,7 @@ def generate_augmentation_suggestions(class_balance: Dict[str, Any]) -> Dict[str
     suggestions = {
         'needs_augmentation': len(class_balance['small_classes']) > 0,
         'small_classes': class_balance['small_classes'],
+        'tiny_classes': class_balance.get('tiny_classes', {}),
         'strategies': []
     }
 
@@ -337,6 +481,18 @@ def generate_augmentation_suggestions(class_balance: Dict[str, Any]) -> Dict[str
     return suggestions
 
 
+def dataframe_fingerprint(df: pd.DataFrame, text_col: str, label_col: str) -> str:
+    """计算数据指纹，用于缓存判断"""
+    sample_text = ''
+    sample_label = ''
+    if len(df) > 0:
+        sample_text = str(df.iloc[0][text_col]) if text_col in df.columns else ''
+        sample_label = str(df.iloc[0][label_col]) if label_col in df.columns else ''
+
+    fingerprint = f"{len(df)}_{df.columns.tolist()}_{sample_text[:50]}_{sample_label}"
+    return hashlib.md5(fingerprint.encode('utf-8')).hexdigest()
+
+
 def run_full_diagnostics(
     df: pd.DataFrame,
     text_col: str,
@@ -344,12 +500,13 @@ def run_full_diagnostics(
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
-    split_col: Optional[str] = None
+    split_col: Optional[str] = None,
+    drift_mode: str = 'auto'
 ) -> Dict[str, Any]:
     texts = df[text_col].astype(str).tolist()
     labels = df[label_col].astype(str).tolist()
 
-    label_issues = detect_label_issues(texts, labels)
+    label_issues, label_issues_meta = detect_label_issues(texts, labels)
     class_balance = analyze_class_balance(labels)
     text_quality = check_text_quality(texts)
     split_stratification = check_split_stratification(
@@ -357,29 +514,44 @@ def run_full_diagnostics(
     )
 
     drift_results = []
-    if split_col and split_col in df.columns:
-        unique_vals = df[split_col].dropna().unique()
-        if len(unique_vals) >= 2:
-            val_a, val_b = unique_vals[0], unique_vals[1]
-            texts_a = df[df[split_col] == val_a][text_col].astype(str).tolist()
-            texts_b = df[df[split_col] == val_b][text_col].astype(str).tolist()
-            drift = check_distribution_drift(texts_a, texts_b, str(val_a), str(val_b))
-            drift_results.append(drift)
+    drift_meta = {'split_col': split_col, 'mode': drift_mode, 'method': ''}
+
+    if split_col and split_col in df.columns and split_col != text_col and split_col != label_col:
+        drift_results = compute_drift_by_split_col(df, text_col, split_col, mode=drift_mode)
+        drift_meta['method'] = f'按列[{split_col}]切分 ({drift_mode})'
     else:
         mid = len(texts) // 2
-        if mid > 0:
-            drift = check_distribution_drift(texts[:mid], texts[mid:], '前半部分', '后半部分')
+        if mid > 0 and len(texts) >= 20:
+            drift = check_distribution_drift(
+                texts[:mid], texts[mid:],
+                label_a='前半部分', label_b='后半部分',
+                split_col_name='(默认前后切分)'
+            )
             drift_results.append(drift)
+            drift_meta['method'] = '默认前后切分(前半vs后半)'
+        else:
+            drift_meta['method'] = '样本太少，未执行漂移检测'
 
     augmentation_suggestions = generate_augmentation_suggestions(class_balance)
 
     total_samples = len(df)
     noise_count = len(label_issues)
+
+    if label_issues_meta['skipped']:
+        cleanlab_score = None
+        noise_ratio = None
+    else:
+        cleanlab_score = round(max(0, 1.0 - (noise_count / max(total_samples, 1))), 4)
+        noise_ratio = round(noise_count / max(total_samples, 1), 4)
+
+    balance_score = round(max(0, 1.0 - class_balance['gini_impurity']), 4)
+
     quality_scores = {
-        'cleanlab_score': round(max(0, 1.0 - (noise_count / max(total_samples, 1))), 4),
-        'noise_ratio': round(noise_count / max(total_samples, 1), 4),
-        'balance_score': round(max(0, 1.0 - class_balance['gini_impurity']), 4),
-        'quality_score': 0.0
+        'cleanlab_score': cleanlab_score,
+        'noise_ratio': noise_ratio,
+        'balance_score': balance_score,
+        'quality_score': 0.0,
+        'label_issues_meta': label_issues_meta
     }
 
     drift_penalty = 0.0
@@ -392,19 +564,23 @@ def run_full_diagnostics(
     text_issue_count = sum(len(v) for v in text_quality.values())
     text_penalty = min(0.2, text_issue_count / max(total_samples, 1))
 
-    quality_scores['quality_score'] = round(max(0, min(1, (
-        quality_scores['cleanlab_score'] * 0.4 +
-        quality_scores['balance_score'] * 0.3 +
+    cleanlab_component = cleanlab_score if cleanlab_score is not None else 0.5
+    quality_score = (
+        cleanlab_component * 0.4 +
+        balance_score * 0.3 +
         (1 - drift_penalty) * 0.15 +
         (1 - text_penalty) * 0.15
-    ))), 4)
+    )
+    quality_scores['quality_score'] = round(max(0, min(1, quality_score)), 4)
 
     return {
         'label_issues': label_issues,
+        'label_issues_meta': label_issues_meta,
         'class_balance': class_balance,
         'text_quality': text_quality,
         'split_stratification': split_stratification,
         'distribution_drift': drift_results,
+        'drift_meta': drift_meta,
         'augmentation_suggestions': augmentation_suggestions,
         'quality_scores': quality_scores,
         'total_samples': total_samples
